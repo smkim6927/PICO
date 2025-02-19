@@ -46,7 +46,7 @@ class CombinedDistillationLoss(nn.Module):
         kl_loss = kl_per_token.mean() * (self.temperature**2)
 
         # (2) Huber Loss
-        # 여기서는 "log_probs(student) - log_probs(teacher)" 에 대한 허버
+        # 여기서는 "log_probs(student) - log_probs(teacher)" 에 대한 Huber
         s_log = F.log_softmax(student_logits, dim=-1)
         t_log = F.log_softmax(teacher_logits, dim=-1)
         diff = s_log - t_log   # (B, seq_len, vocab_size)
