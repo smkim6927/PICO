@@ -1,1 +1,2 @@
-# CPL-CLM
+# Continual Pre-training for Generatvie Models 
+## Proposed mechanism "IVE"
