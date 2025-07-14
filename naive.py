@@ -45,7 +45,7 @@ class Trainer:
         model_name="/path/to/model",
         tokenizer_name="/path/to/model",
         dataset_list=None,
-        output_dir="/home/jovyan/sumin_data/saved_model/naive/",
+        output_dir="/path/to/save",
         batch_size=4,
         seed=777,
         num_epochs=1,
