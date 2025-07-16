@@ -1,4 +1,4 @@
-import os
+import os, json
 import gc
 import random
 import torch
@@ -6,26 +6,33 @@ import numpy as np
 import wandb
 from tqdm import tqdm
 from accelerate import Accelerator
-from torch.optim import AdamW,Adam
+from torch.optim import AdamW, Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.utils.data import DataLoader
-from eval_stability import Eval  # eval.py의 Eval 클래스 import
-from utils.metrics import ContinualLearningMetrics
+from torch.nn.utils.rnn import pad_sequence
+from eval_stability import Eval
+from utils.metrics import ContinualLearningMetrics, calculate_metrics
+from utils.domain_map import domain_info
 
-# Seed 설정 함수
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-# Collate 함수 정의
-def my_custom_collate_fn(batch):
-    from torch.nn.utils.rnn import pad_sequence
 
-    input_ids_list = [item["input_ids"] for item in batch]
-    attention_mask_list = [item["attention_mask"] for item in batch]
-    labels_list = [item["labels"] for item in batch]
+def my_custom_collate_fn(batch):
+    def safe_tensor_conversion(item, dtype=torch.long):
+        if isinstance(item, torch.Tensor):
+            return item.clone().detach().to(dtype=dtype)
+        elif isinstance(item, (list, np.ndarray)):
+            return torch.tensor(item, dtype=dtype)
+        else:
+            return torch.tensor([item], dtype=dtype)
+    
+    input_ids_list = [safe_tensor_conversion(item["input_ids"]) for item in batch]
+    attention_mask_list = [safe_tensor_conversion(item["attention_mask"]) for item in batch]
+    labels_list = [safe_tensor_conversion(item["labels"]) for item in batch]
 
     input_ids_padded = pad_sequence(input_ids_list, batch_first=True, padding_value=0)
     attention_mask_padded = pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
@@ -65,8 +72,8 @@ class Trainer:
         self.accelerator = Accelerator()
         self.device = self.accelerator.device
 
-        self.domain_order = ['kor_medical', 'eng_medical', 'kor_legal', 'eng_legal']  # 도메인 순서 정의
-        self.shot_types = ['zero-shot', '1shot', '3shot', '5shot']  # 평가할 shot 타입들
+        self.domain_order = ['kor_medical', 'eng_medical', 'kor_legal', 'eng_legal']
+        self.shot_types = ['zero-shot', '1shot', '3shot', '5shot']
         self.cl_metrics = ContinualLearningMetrics(num_tasks=len(self.domain_order))
 
     def calculate_plasticity(self, loss_before: float, loss_after: float, eps=1e-8) -> float:
@@ -80,12 +87,12 @@ class Trainer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # 모델 로드 (Teacher와 Student 동일한 초기화)
+        # 모델 로드
         self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
 
     def prepare_data(self, txt_file):
         """단일 데이터셋 준비"""
-        from utils.data.dataset_loader import TextDatasetwchunk  # 데이터셋 로더 임포트
+        from utils.dataset_loader import TextDatasetwchunk
 
         dataset = TextDatasetwchunk(
             txt_file=txt_file,
@@ -101,7 +108,7 @@ class Trainer:
         )
         return dataloader
 
-    def train_on_dataset(self, dataloader, dataset_name):
+    def train_on_dataset(self, dataloader, dataset_name, task_id):
         """단일 데이터셋 학습"""
         
         # Initialize wandb for this dataset if not already done
@@ -125,26 +132,26 @@ class Trainer:
                     "model": self.model_name,
                     "dataset_name": wandb_dataset_name
                 },
-                name=f"{wandb_dataset_name}_{self.model_name}",
+                name=f"{wandb_dataset_name}_{self.model_name.replace('/', '_')}",
                 group="training"
             )
             self.wandb_initialized = True
         elif not self.wandb_initialized:
             wandb.init(mode="disabled")
             self.wandb_initialized = True
+            
         print(f"Training on dataset: {dataset_name}")
-        
+        if self.accelerator.is_main_process:
+            wandb.log({"current_task/id": task_id, "current_task/name": dataset_name})
+            
         optimizer = Adam(self.model.parameters(), lr=self.learning_rate)
       
-        # Accelerator로 준비 (모델, 옵티마이저, 데이터로더)
-        self.model, optimizer, dataloader = \
-            self.accelerator.prepare(
-                self.model,
-                optimizer,
-                dataloader,
-            )
+        # Accelerator로 준비
+        self.model, optimizer, dataloader = self.accelerator.prepare(self.model, optimizer, dataloader)
+        
         global_step = 0
         for epoch in range(self.num_epochs):
+            self.model.train()
             epoch_loss_sum = 0.0
             epoch_plasticity_sum = 0.0
             step_count = 0
@@ -159,26 +166,24 @@ class Trainer:
             for step, batch in enumerate(progress_bar):
                 global_step += 1
 
-                # Forward pass 및 손실 계산 (Cross-Entropy Loss 사용)
                 with torch.no_grad():
                     outputs_before_update = self.model(
-                        input_ids=batch["input_ids"].to(self.device),
-                        attention_mask=batch["attention_mask"].to(self.device),
-                        labels=batch["labels"].to(self.device),
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
                     )
                     loss_before_val = outputs_before_update.loss.item()
 
                 # Forward pass (학습 중)
                 outputs_after_update = self.model(
-                    input_ids=batch["input_ids"].to(self.device),
-                    attention_mask=batch["attention_mask"].to(self.device),
-                    labels=batch["labels"].to(self.device),
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
                 )
                 
                 loss_after_val = outputs_after_update.loss.item()
 
-                # 역전파 및 가중치 업데이트
-                outputs_after_update.loss.backward()
+                self.accelerator.backward(outputs_after_update.loss)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -189,16 +194,13 @@ class Trainer:
                 epoch_plasticity_sum += plasticity_val
                 step_count += 1
 
-                # WandB 로깅 (각 스텝별 정보 기록)
                 if self.accelerator.is_main_process:
                     wandb.log({
                         "step": global_step,
-                        "train/loss_before": loss_before_val,
-                        "train/loss_after": loss_after_val,
-                        "train/plasticity_step": plasticity_val,
+                        f"train_task_{task_id}/loss": loss_after_val,  # .item() 제거
+                        f"train_task_{task_id}/plasticity": plasticity_val,
                     })
 
-                # tqdm 진행바 업데이트
                 progress_bar.set_postfix({
                     "Step": f"{step+1}/{len(dataloader)}",
                     "Global Step": global_step,
@@ -207,33 +209,35 @@ class Trainer:
                     "Plasticity": f"{plasticity_val:.4f}",
                 })
 
-            avg_epoch_loss = epoch_loss_sum / step_count
-            avg_epoch_plasticity = epoch_plasticity_sum / step_count
+            avg_epoch_loss = epoch_loss_sum / step_count if step_count > 0 else 0.0
+            avg_epoch_plasticity = epoch_plasticity_sum / step_count if step_count > 0 else 0.0
             
             print(f"Dataset: {dataset_name}, Epoch {epoch+1} - Avg Loss: {avg_epoch_loss:.4f}, Avg Plasticity: {avg_epoch_plasticity:.4f}")
             gc.collect()
             torch.cuda.empty_cache()
-            # scheduler.step(avg_epoch_loss)
 
-            # 모델 저장 (데이터셋 이름에 맞게)
-            model_save_path = os.path.join(self.output_dir, f"{dataset_name}_epoch_{epoch+1}")
-            unwrapped = self.accelerator.unwrap_model(self.model)
-            unwrapped.model.save_pretrained(model_save_path)
-            self.model.save_pretrained(model_save_path)
-
-            self.tokenizer.save_pretrained(model_save_path)
-            print(f"Model saved at: {model_save_path}")
+            self.accelerator.wait_for_everyone()
+            if self.accelerator.is_main_process:
+                model_save_path = os.path.join(self.output_dir, f"{dataset_name}_epoch_{epoch+1}")
+                os.makedirs(model_save_path, exist_ok=True)
+                
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                unwrapped_model.save_pretrained(model_save_path)
+                self.tokenizer.save_pretrained(model_save_path)
+                print(f"Model saved at: {model_save_path}")
 
         if self.accelerator.is_main_process:
             wandb.finish()
+            self.wandb_initialized = False  # 재설정
         
     def evaluate_and_update_metrics(self, evaluator, task_id_to_eval, shot_type, is_init=False):
         """단일 태스크 평가 및 CL 메트릭 업데이트 헬퍼 함수"""
+        
         domain_to_eval = self.domain_order[task_id_to_eval]
         metrics = evaluator.evaluate(domain=domain_to_eval, shot_type=shot_type)
         accuracy = metrics["cosine_similarity"]
-            
-        self.cl_metrics_tracker.update_accuracy(
+        
+        self.cl_metrics.update_accuracy(
             task_id=task_id_to_eval,
             accuracy=accuracy,
             is_init=is_init
@@ -242,17 +246,8 @@ class Trainer:
 
     def train_across_datasets(self):
         """모든 데이터셋에 대해 순차적으로 학습하고 각 단계별로 평가 수행"""
-        from utils.metrics import calculate_metrics
-    
-        evaluator = Eval(
-            model_name=self.model_name,
-            accelerator=self.accelerator,
-            batch_size=1,
-            max_length=self.max_length,
-            num_epochs=1
-        )
         
-        criterion = torch.nn.CrossEntropyLoss()  # Fisher Information 계산용
+        criterion = torch.nn.CrossEntropyLoss()
         
         for task_id, dataset_file in enumerate(self.dataset_list):
             # 1. 현재 데이터셋으로 학습 수행
@@ -261,7 +256,7 @@ class Trainer:
             current_domain = self.domain_order[task_id]
             
             print(f"\n=== Training on {current_domain} (Task {task_id+1}) ===")
-            self.train_on_dataset(dataloader, dataset_name)
+            self.train_on_dataset(dataloader, dataset_name, task_id)
 
             # 2. 평가용 wandb 초기화
             if self.accelerator.is_main_process:
@@ -277,114 +272,81 @@ class Trainer:
                     }
                 )
             
-            # 3. 현재까지 학습된 모든 도메인에 대해 다양한 shot으로 평가
-            print(f"\n=== Evaluating after {current_domain} training ===")
-            
-            initial_metrics = self.evaluate_and_update_metrics(evaluator, task_id, 'zero-shot', is_init=True)
-            
-            for domain in self.domain_order[:task_id+1]:
-                domain_metrics = {}
-
-                for shot_type in self.shot_types:
-                    print(f"Evaluating {domain} with {shot_type}")
-                    metrics = evaluator.evaluate(domain=domain, shot_type=shot_type)
-                    # 메트릭 로깅
-                    wandb.log({
-                        "metrics/loss": metrics["loss"],
-                        "metrics/rouge1": metrics["rouge1"],
-                        "metrics/rouge2": metrics["rouge2"],
-                        "metrics/rougeL": metrics["rougeL"],
-                        "metrics/bleu": metrics["bleu"],
-                        "metrics/meteor": metrics["meteor"],
-                        "metrics/f1": metrics["f1"],
-                        "metrics/r2": metrics["r2"],
-                        "metrics/exact_match": metrics["exact_match"],
-                        "metrics/groundedness": metrics["groundedness"],
-                        "metrics/cosine_similarity": metrics["cosine_similarity"],
-                        "metrics/jaccard_similarity": metrics["jaccard_similarity"]
-                    })
-
-                    if shot_type == 'zero-shot':
-                        accuracy = metrics["cosine_similarity"]
-                        self.cl_metrics.update_accuracy(
-                            task_id=self.domain_order.index(domain),
-                            accuracy=accuracy,
-                            is_init=(task_id == self.domain_order.index(domain))
-                        )
-            
-            # 4. CL 메트릭, Fisher Information, EMA Drift 계산
-            all_metrics = self.cl_metrics.compute_all_metrics(
-                model=self.model,
-                current_task=task_id,
-                dataloader=dataloader,  # Fisher Information 계산용
-                criterion=criterion
-            )
-            
-            avgf = all_metrics.get('AvgF', 0.0)
-            bwt = all_metrics.get('BWT', 0.0)
-            delta_fisher = all_metrics.get('DeltaFisher', 0.0)
-            ema_drift = all_metrics.get('EMA_Drift', 0.0)
-            
-            # 5. 메트릭 로깅
+            # 3. CL 메트릭 계산 및 로깅
             if self.accelerator.is_main_process:
-                wandb.log({
-                    'current_task': task_id,
-                    'domain': current_domain,
-                    'avgf': avgf,
-                    'bwt': bwt,
-                    'delta_fisher': delta_fisher,
-                    'ema_drift': ema_drift,
-                    'fisher_info_history': len(self.cl_metrics.fisher_history)
-                })
-                
-                # 메트릭 출력
-                print(f"\n=== Metrics for {current_domain} ===")
-                print(f"AvgF: {avgf:.4f}")
-                print(f"BWT: {bwt:.4f}")
-                print(f"Delta Fisher: {delta_fisher:.4f}")
-                print(f"EMA Drift: {ema_drift:.4f}")
-                
+                try:
+                    all_metrics = self.cl_metrics.compute_all_metrics(
+                        model=self.accelerator.unwrap_model(self.model),
+                        current_task=task_id + 1,
+                        dataloader=dataloader,
+                        criterion=criterion
+                    )
+                    
+                    avgf = all_metrics.get('AvgF', 0.0)
+                    bwt = all_metrics.get('BWT', 0.0)
+                    delta_fisher = all_metrics.get('DeltaFisher', 0.0)
+                    ema_drift = all_metrics.get('EMA_Drift', 0.0)
+                    
+                    wandb.log({
+                        'current_task': task_id,
+                        'domain': current_domain,
+                        'avgf': avgf,
+                        'bwt': bwt,
+                        'delta_fisher': delta_fisher,
+                        'ema_drift': ema_drift,
+                        'fisher_info_history': len(self.cl_metrics.fisher_history)
+                    })
+                    
+                    print(f"\n=== Metrics for {current_domain} ===")
+                    print(f"AvgF: {avgf:.4f}")
+                    print(f"BWT: {bwt:.4f}")
+                    print(f"Delta Fisher: {delta_fisher:.4f}")
+                    print(f"EMA Drift: {ema_drift:.4f}")
+                    
+                except Exception as e:
+                    print(f"Error computing CL metrics: {e}")
+                    
                 wandb.finish()
             
-            # 6. 중간 체크포인트 및 메트릭 저장
-            checkpoint_path = os.path.join(
-                self.output_dir,
-                f"checkpoint_after_{current_domain}"
-            )
-            self.model.save_pretrained(checkpoint_path)
-            
-            # 메트릭 저장
-            metrics_path = os.path.join(checkpoint_path, "metrics.json")
-            metrics_data = {
-                "task_id": task_id,
-                "domain": current_domain,
-                "avgf": avgf,
-                "bwt": bwt,
-                "delta_fisher": delta_fisher,
-                "ema_drift": ema_drift,
-                "fisher_info_size": len(self.cl_metrics.fisher_history)
-            }
-            
-            with open(metrics_path, 'w') as f:
-                json.dump(metrics_data, f, indent=2)
+            self.accelerator.wait_for_everyone()
+            if self.accelerator.is_main_process:
+                checkpoint_path = os.path.join(self.output_dir, f"checkpoint_after_{current_domain}")
+                os.makedirs(checkpoint_path, exist_ok=True)
                 
-            print(f"Checkpoint and metrics saved at: {checkpoint_path}")
-
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                unwrapped_model.save_pretrained(checkpoint_path)
+                self.tokenizer.save_pretrained(checkpoint_path)
+                
+                # 메트릭 저장
+                try:
+                    metrics_path = os.path.join(checkpoint_path, "metrics.json")
+                    metrics_data = {
+                        "task_id": task_id,
+                        "domain": current_domain,
+                        "avgf": avgf,
+                        "bwt": bwt,
+                        "delta_fisher": delta_fisher,
+                        "ema_drift": ema_drift,
+                        "fisher_info_size": len(self.cl_metrics.fisher_history)
+                    }
+                    
+                    with open(metrics_path, 'w') as f:
+                        json.dump(metrics_data, f, indent=2)
+                except:
+                    print("Could not save metrics.json")
+                
+                print(f"Checkpoint saved at: {checkpoint_path}")
 
 if __name__ == "__main__":
     trainer = Trainer(
-        model_name="meta-llama/Llama-3.2-1B-Instruct",
+        model_name="openai-community/gpt2-large",
         dataset_list=[
-            "/home/jovyan/sumin_data/cp4llm/utils/dataloader/med_kor_dt/new-medical-kor-dataset.txt",
-            "/home/jovyan/sumin_data/cp4llm/utils/dataloader/med_eng_dt/guidline_medical.txt",
-            "/home/jovyan/sumin_data/cp4llm/utils/dataloader/legal_kor_dt/new-legal-kor-dataset.txt",
-            "/home/jovyan/sumin_data/cp4llm/utils/dataloader/law_datasets/eng-new-legal-dataset.txt"
+            "/home/infonet/sumin/cp4gm/utils/data_storage/guidline_medical.txt"
         ],
-        output_dir="/home/jovyan/sumin_data/saved_model/recyclable/",
-        batch_size=8,
-        num_epochs=1,
+        output_dir="/home/infonet/sumin/saved_model/recyclable/",
+        batch_size=1,
+        num_epochs=5,
         learning_rate=2e-5,
     )
-    
     trainer.load_model_and_tokenizer()
     trainer.train_across_datasets()
