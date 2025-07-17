@@ -1,4 +1,11 @@
-import os, re
+import os, re, ast
+import random
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, DistributedSampler
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from accelerate import Accelerator
+from utils.metrics import calculate_metrics 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 
 import torch
@@ -13,7 +20,6 @@ import numpy as np
 
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from optimizer.upgd import UPGD32
 from utils.metrics import calculate_metrics
 
 
@@ -160,46 +166,6 @@ def law_preprocess_function(examples, domain, shot_type, shot_examples, tokenize
     return model_inputs
 
 
-# def medi_preprocess_function(examples, domain, shot_type, shot_examples, tokenizer, max_length=1024):
-#     """
-#     eng_medical (openlifescienceai/medmcqa) 전용 전처리 함수.
-#     Multiple-choice이므로 opa/opb/opc/opd/cop 컬럼을 처리.
-#     """
-#     questions = examples["question"]
-#     options = [examples["opa"], examples["opb"], examples["opc"], examples["opd"]]
-#     correct_answers = examples["cop"]
-
-#     prompts = []
-#     for i, question in enumerate(questions):
-#         prompt = (
-#             f"Question: {question}\n"
-#             f"Options:\n"
-#             f"A) {options[0][i]}\n"
-#             f"B) {options[1][i]}\n"
-#             f"C) {options[2][i]}\n"
-#             f"D) {options[3][i]}\n"
-#             f"Answer:"
-#         )
-#         prompts.append(prompt)
-
-#     model_inputs = tokenizer(
-#         prompts,
-#         max_length=max_length,
-#         truncation=True,
-#         padding="max_length",
-#         return_tensors="pt"
-#     )
-#     labels = tokenizer(
-#         [options[correct_answers[i] - 1][i] for i in range(len(correct_answers))],
-#         max_length=max_length,
-#         truncation=True,
-#         padding="max_length",
-#         return_tensors="pt"
-#     )
-#     model_inputs["labels"] = labels["input_ids"]
-    
-#     return model_inputs
-
 def medi_preprocess_function_new(examples, domain, shot_type, shot_examples, tokenizer, max_length=1024):
     """
     mamachang/medical-reasoning 데이터셋 전용 전처리 함수.
@@ -267,6 +233,7 @@ def medi_preprocess_function_new(examples, domain, shot_type, shot_examples, tok
         
     return model_inputs
 
+
 def parse_input_text(input_text):
     """
     input 텍스트에서 질문과 선택지 파싱
@@ -304,6 +271,7 @@ def parse_input_text(input_text):
         "options": options
     }
 
+
 def parse_options_regex(options_str):
     """
     정규식을 사용한 선택지 파싱 (백업 방법)
@@ -318,6 +286,7 @@ def parse_options_regex(options_str):
         print(f'letter:{letter}\t option:{options[letter]}')
     
     return options
+
 
 def extract_answer_from_output(output_text):
     """
