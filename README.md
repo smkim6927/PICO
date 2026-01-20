@@ -1,2 +1,2 @@
 # Continual Pre-training for Generatvie Models 
-## Proposed mechanism "IVE"
+## Proposed mechanism "HPO"
