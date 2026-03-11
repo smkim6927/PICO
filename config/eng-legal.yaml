@@ -1,7 +1,0 @@
-model_name: "EleutherAI/gpt-neo-125m"
-tokenizer_name: "EleutherAI/gpt-neo-125m"  # tokenizer_name이 model_name과 같다면 생략 가능
-txt_file: "pth/.txt"
-output_dir: "pth/"
-num_epochs: 3
-batch_size: 16
-max_length: 512
