@@ -1,14 +1,13 @@
 # eval/run_cl_eval.py
-
+import os
 import argparse
 from typing import List, Tuple
 
-# 위에서 만든 모듈 import
-from eval.cl_evaluator import CLEvaluatorCL, set_seed
+from modules.cl_evaluator import CLEvaluatorCL, set_seed
 
 def parse_curriculum_arg(arg: str) -> List[Tuple[str, str, int]]:
     """
-    형식: "domain:path:epoch,domain:path:epoch,..."
+        "domain:path:epoch,domain:path:epoch,..."
     """
     items = []
     if not arg:
@@ -40,6 +39,7 @@ def main():
     parser.add_argument("--dump_raw_json", action="store_true")
     parser.add_argument("--preprocessed_eval_root", type=str, default=None)
     parser.add_argument("--per_domain_metrics", type=str, default="ppl,rougeL,bleu")
+    parser.add_argument("--shot_type", type=str, default="zero-shot", help="e.g., 'zero-shot', '3-shot', '3shot'")
 
     args = parser.parse_args()
 
@@ -48,6 +48,7 @@ def main():
     curriculum = parse_curriculum_arg(args.curriculum)
     eval_domains = [d.strip() for d in args.eval_domains.split(",")] if args.eval_domains else None
     per_domain_metrics = [m.strip() for m in args.per_domain_metrics.split(",") if m.strip()]
+
 
     evaluator = CLEvaluatorCL(
         output_dir=args.output_dir,
@@ -62,6 +63,8 @@ def main():
         log_raw_json=args.dump_raw_json,
         preprocessed_eval_root=args.preprocessed_eval_root,
         per_domain_metrics=per_domain_metrics,
+        shot_type=args.shot_type,
+        seed=args.seed,
     )
     evaluator.run()
 
