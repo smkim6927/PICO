@@ -1,3 +1,5 @@
+#cp4llm/utils/domain_map.py
+
 import os
 from typing import Tuple, Union, Optional
 import re
@@ -10,25 +12,77 @@ from torch.utils.data import IterableDataset
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
+def _num_shots_from_type(shot_type: str) -> int:
+    if not shot_type:
+        return 0
+    st = str(shot_type).strip().lower().replace(" ", "")
+    if st in {"zero-shot", "zeroshot", "0-shot", "0shot", "0"}:
+        return 0
+    if st in {"3-shot", "3shot", "three-shot", "threeshot", "3"}:
+        return 3
+    m = re.match(r"^(\d+)[-]?shot$", st)
+    if m:
+        return int(m.group(1))
+    return 0
 
 def _parse_medical_reasoning(example):
     """
     eng_medical (mamachang/medical-reasoning) 전용 parser.
-    이 데이터셋은 features: ['output', 'input', 'instruction'] 구조를 가짐. :contentReference[oaicite:0]{index=0}
-    우리가 쓰는 건 input(질문+컨텍스트) / output(답변) 이라서 아래처럼 매핑하는 게 맞음.
+    수정 사항: <answer> 태그 안에서 "E: Description" 형태일 경우 "E"만 추출하도록 로직 추가.
     """
     input_text = example.get("input", "")
     output_text = example.get("output", "")
 
-    # input에서 'Q:' 이후를 질문으로 사용 (없으면 전체)
-    question = input_text.split("Q:", 1)[1].strip() if "Q:" in input_text else input_text
+    # 1. Question 구성 (이전과 동일)
+    if input_text.strip().startswith("Q:"):
+        context = input_text.split("Q:", 1)[1].strip()
+    else:
+        context = input_text.strip()
 
-    # output에서 <answer>...</answer> 태그만 추출 (없으면 전체 출력 사용)
+    question = f"Q: {context}"
+
+    # 2. Target(정답) 추출 및 클래스 분리 (핵심 수정 부분)
     answer_match = re.search(r'<answer>(.*?)</answer>', output_text, re.DOTALL)
-    answer = answer_match.group(1).strip() if answer_match else output_text
+    
+    if answer_match:
+        # 예: "E: Subarachnoid hemorrhage"
+        raw_answer = answer_match.group(1).strip()
+        
+        # 콜론(:)을 기준으로 쪼개서 앞부분(알파벳)만 가져옴
+        # 만약 "E"라고만 적혀 있어도 split(':')[0]은 "E"를 반환하므로 안전함
+        answer = raw_answer.split(':')[0].strip()
+        
+        # (옵션) 혹시 모를 점(.) 제거 (예: "E." -> "E")
+        answer = answer.replace(".", "")
+    else:
+        # 태그가 없는 경우 fallback
+        answer = output_text.strip().split(':')[0].strip()
 
     return {"text": question, "target": answer}
 
+def _parse_gsm8k(example):
+    """
+    GSM8K(openai/gsm8k) 전용 parser.
+
+    - HF 데이터셋 openai/gsm8k 의 컬럼은 question / answer 로 구성됨.
+      question: 문제 문장
+      answer: 풀이 + 마지막 줄에 '#### 최종답' 형식의 문자열  
+
+    - text  : question 그대로 사용
+    - target: answer에서 '####' 뒤의 최종 답만 잘라서 사용
+    """
+    question = example.get("question", "")
+    answer_full = example.get("answer", "")
+
+    # '#### 정답' 패턴에서 정답만 추출
+    m = re.search(r"####\s*([^\n]+)", answer_full)
+    if m:
+        final_ans = m.group(1).strip()
+    else:
+        # 혹시 ####가 없는 예외 케이스가 있다면 전체를 사용
+        final_ans = answer_full.strip()
+
+    return {"text": question.strip(), "target": final_ans}
 
 # 각 도메인별 메타 정보: pretrain 파일, HF dataset, 컬럼명, 태스크 타입, parser 등
 domain_info = {
@@ -47,15 +101,17 @@ domain_info = {
     },
 
     # 영어 의료 reasoning (HF: mamachang/medical-reasoning)
+    # "parser_fn": _parse_medical_reasoning,
+    # Shekswess/medical_gemma_instruct_dataset
     "eng_medical": {
         "pretrain_data_path": "utils/data_storage/guidline_medical.txt",
-        "dataset_name": "mamachang/medical-reasoning",
+        "dataset_name": "Shekswess/medical_gemma_instruct_dataset",
         "encoding": "utf-8",
-        # 이 데이터셋은 features: ['output', 'input', 'instruction']이므로 :contentReference[oaicite:2]{index=2}
+        # 이 데이터셋은 features: ['output', 'input', 'instruction']
         # columns 를 그대로 쓰는 대신 parser_fn에서 text/target을 만들어냄.
         "columns": {"text": "input", "target": "output"},
         "task_type": "qa",
-        "parser_fn": _parse_medical_reasoning,
+        "parser_fn": None,
     },
 
     # 한국어 법률 QA (LawQA-Ko)
@@ -79,6 +135,17 @@ domain_info = {
         "task_type": "summarization",
         "parser_fn": None,
     },
+    
+    "math": {
+        "pretrain_data_path": None,  # pretrain 용으로는 사용하지 않을 것이므로 None
+        "dataset_name": "openai/gsm8k",
+        "hf_config": "main",             # openai/gsm8k 의 subset(main / socratic 중 main 사용)
+        "encoding": "utf-8",
+        # 원본 컬럼 이름(question, answer) – parser_fn 이 최종 text/target을 만들어줌
+        "columns": {"text": "question", "target": "answer"},
+        "task_type": "math",
+        "parser_fn": _parse_gsm8k,
+    },    
 }
 
 
@@ -107,6 +174,12 @@ def create_prompt(text, domain, shot_type="zero-shot", shot_examples=None):
             f"Summarize the following legal judgement:\n\n"
             f"{few_shot_context}"
             f"Judgement: {text}\nSummary:"
+        )
+    elif task_type == "math":
+        return (
+            f"Solve the following math word problem.\n\n"
+            f"{few_shot_context}"
+            f"Question: {text}\nAnswer:"
         )
     else:
         q_str, a_str = ("질문", "답변") if domain.startswith("kor_") else ("Question", "Answer")
@@ -279,7 +352,6 @@ def _strip_right_padding(example, pad_id: int):
 
     return example
 
-
 def get_processed_dataset(
     domain,
     tokenizer,
@@ -288,6 +360,7 @@ def get_processed_dataset(
     split="train",
     shot_type="zero-shot",
     preprocessed_root: Optional[str] = None,
+    seed: int = 777,
 ):
     info = domain_info[domain]
 
@@ -299,15 +372,26 @@ def get_processed_dataset(
 
     if mode != "evaluation":
         raise ValueError("mode는 'pretrain' 또는 'evaluation' 이어야 합니다.")
-
+    n_shots = _num_shots_from_type(shot_type)
+    shot_suffix = "" if n_shots == 0 else f"_{n_shots}shot"
     # 1) preprocessed 우선
     if preprocessed_root is not None:
-        local_path = os.path.join(preprocessed_root, f"{domain}_{split}")
-        if os.path.exists(local_path):
+        # few-shot일 때 zero-shot 캐시를 잘못 재사용하지 않도록 suffix 분리
+        candidate_paths = []
+        if n_shots == 0:
+            # 기존 호환: {domain}_{split} 우선, 없으면 {domain}_{split}_0shot도 허용
+            candidate_paths = [
+                os.path.join(preprocessed_root, f"{domain}_{split}"),
+                os.path.join(preprocessed_root, f"{domain}_{split}_0shot"),
+            ]
+        else:
+            candidate_paths = [os.path.join(preprocessed_root, f"{domain}_{split}{shot_suffix}")]
+
+        local_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+        if local_path is not None:
             print(f"[get_processed_dataset] Using preprocessed eval dataset from: {local_path}")
             ds = load_from_disk(local_path)
 
-            # ✅ 과거 right padding 제거
             pad_id = int(tokenizer.pad_token_id or 0)
             ds = ds.map(lambda ex: _strip_right_padding(ex, pad_id), batched=False)
             if "attention_mask" in ds.column_names:
@@ -315,16 +399,44 @@ def get_processed_dataset(
 
             return ds
 
-    # 2) HF raw
+    # 2) HF raw 로딩 (★ config 지원)
     dataset_name = info.get("dataset_name")
-    raw_dataset = load_dataset(dataset_name, split=split)
+    hf_config = info.get("hf_config", None)
+
+    if hf_config is not None:
+        raw_dataset = load_dataset(dataset_name, hf_config, split=split)
+    else:
+        raw_dataset = load_dataset(dataset_name, split=split)
+
+    # 2.5) few-shot 예시 샘플링 (도메인별 1회 고정)
+    shot_examples = None
+    if n_shots > 0:
+        shot_examples = []
+        # shot 예시 자체가 너무 긴 경우를 줄이기 위해(최소한) zero-shot 기준 길이 필터로 선별
+        base_filter = make_length_filter(
+            tokenizer=tokenizer,
+            domain=domain,
+            max_length=max_length,
+            shot_type="zero-shot",
+            shot_examples=None,
+        )
+
+        # reproducible sampling: shuffle(seed=seed) 권장 패턴 :contentReference[oaicite:1]{index=1}
+        shuffled = raw_dataset.shuffle(seed=seed)
+        for ex in shuffled:
+            if base_filter(ex):
+                shot_examples.append(ex)
+                if len(shot_examples) >= n_shots:
+                    break
+        if len(shot_examples) == 0:
+            shot_examples = None
 
     length_filter = make_length_filter(
         tokenizer=tokenizer,
         domain=domain,
         max_length=max_length,
         shot_type=shot_type,
-        shot_examples=None,
+        shot_examples=shot_examples,
     )
     raw_dataset = raw_dataset.filter(length_filter)
 
@@ -334,7 +446,7 @@ def get_processed_dataset(
         domain=domain,
         max_length=max_length,
         shot_type=shot_type,
-        shot_examples=None,
+        shot_examples=shot_examples,
     )
 
     return raw_dataset.map(
@@ -342,7 +454,6 @@ def get_processed_dataset(
         batched=True,
         remove_columns=raw_dataset.column_names,
     )
-
 
 def get_collate_fn(collate_type: str = "smart", pad_id: int = 0):
     """
@@ -377,7 +488,7 @@ def get_collate_fn(collate_type: str = "smart", pad_id: int = 0):
         for i, s in enumerate(seqs):
             l = int(s.numel())
             if l > 0:
-                out[i, -l:] = s  # ✅ 오른쪽 정렬 => left padding
+                out[i, -l:] = s
         return out
 
     def smart_collate(batch):
