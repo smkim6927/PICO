@@ -46,11 +46,11 @@ def seed_worker(worker_id: int):
     random.seed(worker_seed)
 
 
-"""
-LEFT-pad utilities
-  F.pad(x, (pad_size, 0))  →  왼쪽에만 padding (= left-pad)
-  tokenizer.padding_side="left" 와 정확히 일치
-"""
+# ─────────────────────────────────────────────────────────────────────────────
+# LEFT-pad utilities
+#   F.pad(x, (pad_size, 0))  →  왼쪽에만 padding (= left-pad)
+#   tokenizer.padding_side="left" 와 정확히 일치
+# ─────────────────────────────────────────────────────────────────────────────
 def left_pad_sequence(sequences, padding_value=0):
     """1-D tensor 리스트를 left-padding 으로 stack → (B, max_len)."""
     max_len = max(s.size(0) for s in sequences)
@@ -95,7 +95,9 @@ def assert_left_padded(input_ids: torch.Tensor, attention_mask: torch.Tensor, pa
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Replay Buffer
+# ─────────────────────────────────────────────────────────────────────────────
 class TokenReplayBuffer:
     """
     Stage 완료 후 샘플들을 저장하는 버퍼. (FIFO via deque(maxlen=...))
@@ -122,7 +124,9 @@ class TokenReplayBuffer:
         return len(self.buffer)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Mixed Batch (replay 비율만큼 current를 *대체* → 총 batch size 유지, ALL LEFT-PAD)
+# ─────────────────────────────────────────────────────────────────────────────
 def mix_batch_with_replay(
     current_batch: dict,
     replay_buffer: TokenReplayBuffer,
@@ -197,7 +201,9 @@ def mix_batch_with_replay(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Trainer
+# ─────────────────────────────────────────────────────────────────────────────
 class Trainer:
     def __init__(
         self,
@@ -290,6 +296,7 @@ class Trainer:
 
         os.makedirs(self.output_dir, exist_ok=True)
 
+    # ─────────────────────────────────────────────────────────────────────
     def load_model_and_tokenizer(self):
         if self.accelerator.is_main_process:
             print(f"[INFO] Loading model: {self.model_name}")
@@ -315,6 +322,7 @@ class Trainer:
         self.model.gradient_checkpointing_enable()
         self.model.train()
 
+        # ── FSDP prepare는 모델/옵티마이저 모두 단 1회 ────────────────────
         self.optimizer = Adam(self.model.parameters(), lr=self.learning_rate)
         self.model, self.optimizer = self.accelerator.prepare(
             self.model, self.optimizer
@@ -325,6 +333,7 @@ class Trainer:
             print(f"[DEBUG] padding_side : {self.tokenizer.padding_side}")
             print(f"[DEBUG] FSDP prepared once for model + optimizer")
 
+    # ─────────────────────────────────────────────────────────────────────
     def _make_collate_fn(self):
         self._collate_debug_done = False
 
@@ -400,6 +409,7 @@ class Trainer:
         )
         return dataset, loader
 
+    # ─────────────────────────────────────────────────────────────────────
     def _update_replay_buffer(self, dataset, stage_idx: int, dataset_name: str):
         """
         stage 완료 후, 학습에 사용한 dataset을 재활용.
@@ -438,6 +448,7 @@ class Trainer:
                 f"(deterministic across ranks)"
             )
 
+    # ─────────────────────────────────────────────────────────────────────
     def _init_wandb(self, dataset_name: str):
         if self.wandb_initialized:
             return
@@ -484,6 +495,7 @@ class Trainer:
 
         self.wandb_initialized = True
 
+    # ─────────────────────────────────────────────────────────────────────
     def _save_model(self, dataset_name: str, epoch: int):
         self.accelerator.wait_for_everyone()
         save_path = os.path.join(
@@ -514,6 +526,7 @@ class Trainer:
 
         self.accelerator.wait_for_everyone()
 
+    # ─────────────────────────────────────────────────────────────────────
     def train_on_dataset(self, dataloader: DataLoader, dataset_name: str):
         self._init_wandb(dataset_name)
 
@@ -630,6 +643,7 @@ class Trainer:
 
             self._save_model(dataset_name, epoch + 1)
 
+    # ─────────────────────────────────────────────────────────────────────
     def train_across_datasets(self):
         for stage_idx, dataset_file in enumerate(self.dataset_list):
             dataset_name = os.path.basename(dataset_file).split(".")[0]
@@ -663,14 +677,14 @@ if __name__ == "__main__":
     trainer = Trainer(
         model_name="meta-llama/Llama-3.2-1B",
         dataset_list=[
-            "../utils/data_storage/new-medical-kor-dataset.txt",
-            "../utils/data_storage/guidline_medical.txt",
-            "..m/utils/data_storage/new-legal-kor-dataset.txt",
-            "../utils/data_storage/eng-new-legal-dataset.txt",
+            "/home/jovyan/sumin_data/cp4llm/utils/data_storage/new-medical-kor-dataset.txt",
+            "/home/jovyan/sumin_data/cp4llm/utils/data_storage/guidline_medical.txt",
+            "/home/jovyan/sumin_data/cp4llm/utils/data_storage/new-legal-kor-dataset.txt",
+            "/home/jovyan/sumin_data/cp4llm/utils/data_storage/eng-new-legal-dataset.txt",
         ],
-        output_dir="../saved_model/adam_replay/",
-        batch_size=24,
-        num_epochs=5,
+        output_dir="/home/jovyan/sumin_data/saved_model/adam_replay/",
+        batch_size=4,
+        num_epochs=1,
         learning_rate=2e-5,
         max_length=256,
         chunk_size=64,
