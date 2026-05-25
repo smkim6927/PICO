@@ -1,0 +1,732 @@
+import os
+
+# ============================================================
+# Reproducibility-related environment variables (set BEFORE torch import)
+# ============================================================
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTHONHASHSEED"] = "777"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+import gc
+import random
+from functools import partial
+
+import numpy as np
+import torch
+import wandb
+from tqdm import tqdm
+
+from accelerate import Accelerator, FullyShardedDataParallelPlugin
+from accelerate.utils import set_seed as accelerate_set_seed
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullOptimStateDictConfig,
+    FullStateDictConfig,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.optim import AdamW
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from torch.utils.data import DataLoader
+
+from utils.dataset_loader import TextDatasetwchunk
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reproducibility helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def set_seed(seed: int, deterministic: bool = True):
+    random.seed(seed)
+    np.random.seed(seed)
+    accelerate_set_seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Left-pad utilities
+# ─────────────────────────────────────────────────────────────────────────────
+def left_pad_sequence(sequences, padding_value=0):
+    max_len = max(s.size(0) for s in sequences)
+    padded = []
+    for s in sequences:
+        pad_size = max_len - s.size(0)
+        if pad_size > 0:
+            s = torch.nn.functional.pad(s, (pad_size, 0), value=padding_value)
+        padded.append(s)
+    return torch.stack(padded, dim=0)
+
+
+def assert_left_padded(input_ids, attention_mask):
+    bsz, _ = attention_mask.shape
+    for i in range(bsz):
+        zeros = (attention_mask[i] == 0).nonzero(as_tuple=True)[0]
+        ones = (attention_mask[i] == 1).nonzero(as_tuple=True)[0]
+        if len(zeros) == 0 or len(ones) == 0:
+            continue
+        if zeros.max() >= ones.min():
+            return False
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EWC: LLM/FSDP-friendly implementation
+#   Reference: Kirkpatrick et al. (2017),
+#   "Overcoming catastrophic forgetting in neural networks." PNAS 114(13).
+#
+#   ▸ Fisher and stored params are kept on CPU (memory-friendly across tasks).
+#   ▸ Fisher is computed using the FSDP-wrapped model so every rank holds the
+#     same Fisher (no rank-divergence on penalty backward).
+#   ▸ penalty() works against the currently-wrapped model by matching params
+#     by name; unmatched names are skipped silently (FSDP prefix-safe).
+# ─────────────────────────────────────────────────────────────────────────────
+class EWC:
+    """
+    Elastic Weight Consolidation (Kirkpatrick et al., PNAS 2017).
+    Online-friendly variant: per-task Fisher diagonals stored on CPU.
+
+    Notes for LLM continual pre-training:
+      - Fisher F_i ≈ E[(∂ log p(y|x) / ∂ θ_i)^2] ≈ E[(∂ L / ∂ θ_i)^2]
+        (sign cancels under square, so supervised CE-loss gradient is fine.)
+      - Use a small `num_batches` (e.g. 100–500) — Fisher converges quickly.
+      - λ for LLMs is typically much smaller than vision (try 0.1–100).
+    """
+
+    def __init__(self, fisher_cpu: dict, params_cpu: dict, lambda_ewc: float):
+        # Both dicts hold CPU tensors keyed by parameter name.
+        self.fisher = fisher_cpu
+        self.params = params_cpu
+        self.lambda_ewc = lambda_ewc
+
+    @classmethod
+    def from_model(
+        cls,
+        accelerator,
+        model,
+        dataloader,
+        lambda_ewc: float,
+        num_batches: int = 200,
+        debug: bool = True,
+    ):
+        """
+        FSDP-aware Fisher estimation.
+        - All ranks run the same forward/backward → identical grads → identical Fisher.
+        - We use `accelerator.unwrap_model(model).named_parameters()` only for
+          NAMING; gradient values are read from the wrapped model's `.grad`.
+        """
+        model.eval()
+        device = accelerator.device
+
+        # named_parameters는 wrapped model에서 가져와 FSDP-shard 텐서에 직접 접근.
+        # FSDP + use_orig_params=True 환경에서는 named_parameters가 원래 이름을 그대로 노출.
+        fisher_gpu = {
+            n: torch.zeros_like(p.data)
+            for n, p in model.named_parameters()
+            if p.requires_grad
+        }
+        param_snapshot_cpu = {
+            n: p.detach().to("cpu", copy=True)
+            for n, p in model.named_parameters()
+            if p.requires_grad
+        }
+
+        n_used = 0
+        if accelerator.is_main_process and debug:
+            print(f"[EWC] Computing Fisher Information over up to {num_batches} batches...")
+
+        pbar = tqdm(
+            dataloader,
+            desc="Fisher",
+            total=min(num_batches, len(dataloader)),
+            disable=not accelerator.is_main_process,
+            leave=False,
+        )
+
+        for batch_idx, batch in enumerate(pbar):
+            if batch_idx >= num_batches:
+                break
+
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["labels"]
+
+            if (labels != -100).sum().item() == 0:
+                continue
+
+            # zero grads on the (wrapped) model
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad = None
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+            loss = outputs.loss
+            # accelerator.backward는 FSDP에서 grad를 모든 rank에 sync해 줌
+            accelerator.backward(loss)
+
+            with torch.no_grad():
+                for n, p in model.named_parameters():
+                    if p.grad is not None and n in fisher_gpu:
+                        fisher_gpu[n] += p.grad.detach() ** 2
+
+            n_used += 1
+
+        # clear grads after Fisher estimation
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad = None
+
+        # mean over batches, move to CPU to save GPU memory across tasks
+        fisher_cpu = {}
+        for n, f in fisher_gpu.items():
+            f_mean = f / max(n_used, 1)
+            fisher_cpu[n] = f_mean.detach().to("cpu", copy=True)
+        del fisher_gpu
+
+        if accelerator.is_main_process and debug:
+            total_fisher = sum(v.sum().item() for v in fisher_cpu.values())
+            print(f"[EWC] Fisher done. batches_used={n_used}, "
+                  f"sum(F)={total_fisher:.3e}, lambda={lambda_ewc}")
+
+        model.train()
+        return cls(fisher_cpu=fisher_cpu, params_cpu=param_snapshot_cpu,
+                   lambda_ewc=lambda_ewc)
+
+    def penalty(self, model) -> torch.Tensor:
+        """
+        L_EWC = (λ/2) * Σ_i F_i (θ_i - θ*_i)^2
+        Computed on the device of each current parameter; Fisher/θ* moved
+        on-the-fly to avoid permanent GPU residency.
+        """
+        device = next(model.parameters()).device
+        loss = torch.zeros((), device=device)
+        for n, p in model.named_parameters():
+            if n not in self.fisher or not p.requires_grad:
+                continue
+            f = self.fisher[n].to(device, non_blocking=True)
+            theta_star = self.params[n].to(device, non_blocking=True)
+            loss = loss + (f * (p - theta_star).pow(2)).sum()
+        return 0.5 * self.lambda_ewc * loss
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trainer: AdamW + EWC + Continual Pre-Training (No Replay)
+# ─────────────────────────────────────────────────────────────────────────────
+class EWCTrainer:
+    def __init__(
+        self,
+        model_name,
+        dataset_list,
+        output_dir="/home/jovyan/sumin_data/saved_model/ewc/",
+        batch_size=2,
+        seed=777,
+        num_epochs=1,
+        learning_rate=2e-5,
+        max_length=256,
+        chunk_size=64,
+        gradient_accumulation_steps=8,
+        num_workers=4,
+        # ── EWC hyperparameters ─────────────────────────────────────
+        lambda_ewc=10.0,          # LLM 스케일에 맞춘 기본값 (0.1~100 권장)
+        fisher_num_batches=200,   # Fisher 추정 batch 수
+        online_ewc=False,         # True → 누적 Fisher 1개만 유지
+        ewc_gamma=0.95,           # online EWC 감쇠율
+        # ────────────────────────────────────────────────────────────
+        debug=True,
+        use_wandb=True,
+    ):
+        if not dataset_list:
+            raise ValueError("dataset_list must be a non-empty list.")
+
+        self.model_name = model_name
+        self.tokenizer_name = model_name
+        self.dataset_list = dataset_list
+        self.output_dir = output_dir
+        self.batch_size = batch_size
+        self.seed = seed
+        self.num_epochs = num_epochs
+        self.learning_rate = learning_rate
+        self.max_length = max_length
+        self.chunk_size = chunk_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_workers = num_workers
+
+        self.lambda_ewc = lambda_ewc
+        self.fisher_num_batches = fisher_num_batches
+        self.online_ewc = online_ewc
+        self.ewc_gamma = ewc_gamma
+
+        self.debug = debug
+        self.use_wandb = use_wandb
+
+        set_seed(self.seed, deterministic=True)
+
+        # ── FSDP plugin ─────────────────────────────────────────────
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={LlamaDecoderLayer},
+        )
+        fsdp_plugin = FullyShardedDataParallelPlugin(
+            auto_wrap_policy=auto_wrap_policy,
+            state_dict_config=FullStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            optim_state_dict_config=FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=False),
+            use_orig_params=True,  # named_parameters의 키를 원래 이름으로 유지
+        )
+
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            mixed_precision="bf16",
+            fsdp_plugin=fsdp_plugin,
+        )
+        self.device = self.accelerator.device
+
+        if self.debug and self.accelerator.is_main_process:
+            print(f"\n{'=' * 60}")
+            print("[INFO] AdamW + EWC + Continual Pre-Training (NO REPLAY)")
+            print(f"{'=' * 60}")
+            print(f"# processes      : {self.accelerator.num_processes}")
+            print(f"Device           : {self.device}")
+            print(f"# stages         : {len(self.dataset_list)}")
+            print(f"lambda_ewc       : {self.lambda_ewc}")
+            print(f"fisher_batches   : {self.fisher_num_batches}")
+            print(f"online_ewc       : {self.online_ewc} (gamma={self.ewc_gamma})")
+            print(f"padding_side     : left")
+            print(f"{'=' * 60}\n")
+
+        self.wandb_initialized = False
+        self._collate_debug_done = False
+        self.tokenizer = None
+        self.model = None
+        self.optimizer = None
+        self.global_update_step = 0
+
+        # EWC stores
+        self.ewc_list = []          # 분산 환경에서 모든 rank가 동일한 list 유지
+        self.current_stage_idx = 0
+
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    # ─────────────────────────────────────────────────────────────────
+    def load_model_and_tokenizer(self):
+        if self.accelerator.is_main_process:
+            print(f"[INFO] Loading model: {self.model_name}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer_name,
+            padding_side="left",
+            trust_remote_code=True,
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.tokenizer.padding_side = "left"
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.bfloat16,
+            use_cache=False,
+            trust_remote_code=True,
+        )
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.model.config.use_cache = False
+        self.model.gradient_checkpointing_enable()
+        self.model.train()
+
+        # ── Optimizer ──────────────────────────────────────────────
+        raw_optimizer = AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01,
+        )
+
+        # ── FSDP prepare: model + optimizer 단 1회 ──────────────────
+        self.model, self.optimizer = self.accelerator.prepare(
+            self.model, raw_optimizer
+        )
+
+        if self.debug and self.accelerator.is_main_process:
+            print(f"[DEBUG] Tokenizer padding side : {self.tokenizer.padding_side}")
+            print(f"[DEBUG] Pad token ID           : {self.tokenizer.pad_token_id}")
+            print(f"[DEBUG] FSDP prepared once for model + AdamW")
+
+    # ─────────────────────────────────────────────────────────────────
+    def _make_collate_fn(self):
+        self._collate_debug_done = False
+
+        def _collate_fn(batch):
+            pad_id = int(
+                self.tokenizer.pad_token_id
+                if self.tokenizer.pad_token_id is not None
+                else 0
+            )
+            input_ids_list = [item["input_ids"] for item in batch]
+            attention_mask_list = [item["attention_mask"] for item in batch]
+
+            input_ids_padded = left_pad_sequence(input_ids_list, padding_value=pad_id)
+            attention_mask_padded = left_pad_sequence(attention_mask_list, padding_value=0)
+            labels_padded = input_ids_padded.clone()
+            labels_padded[attention_mask_padded == 0] = -100
+
+            if (self.debug and not self._collate_debug_done
+                    and self.accelerator.is_main_process):
+                self._collate_debug_done = True
+                valid = (labels_padded != -100).sum().item()
+                mismatch = (
+                    (input_ids_padded == pad_id) ^ (attention_mask_padded == 0)
+                ).sum().item()
+                is_left = assert_left_padded(input_ids_padded, attention_mask_padded)
+                print(
+                    f"[debug][collate] pad_id={pad_id}, bsz={len(batch)}, "
+                    f"seq_len={input_ids_padded.size(1)}, "
+                    f"valid_labels={valid}, pad_mask_mismatch={mismatch}, "
+                    f"left_padded={is_left}"
+                )
+
+            return {
+                "input_ids": input_ids_padded,
+                "attention_mask": attention_mask_padded,
+                "labels": labels_padded,
+            }
+        return _collate_fn
+
+    def prepare_data(self, txt_file: str):
+        dataset = TextDatasetwchunk(
+            txt_file=txt_file,
+            tokenizer=self.tokenizer,
+            max_length=self.max_length,
+            chunk_size=self.chunk_size,
+        )
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=self._make_collate_fn(),
+            num_workers=self.num_workers,
+            pin_memory=True,
+            worker_init_fn=seed_worker,
+            generator=g,
+            persistent_workers=False,
+            drop_last=False,
+        )
+        return dataset, loader
+
+    # ─────────────────────────────────────────────────────────────────
+    def _compute_ewc_penalty(self) -> torch.Tensor:
+        """모든 누적 EWC task에 대한 penalty 합."""
+        if len(self.ewc_list) == 0:
+            return torch.zeros((), device=self.device)
+        total = torch.zeros((), device=self.device)
+        for ewc in self.ewc_list:
+            total = total + ewc.penalty(self.model)
+        return total
+
+    def _update_ewc_after_stage(self, dataloader, dataset_name: str):
+        """
+        Stage 완료 후 Fisher Information을 추정하여 ewc_list에 추가.
+        All ranks run identically (FSDP-synced) → ewc_list가 rank별로 동일.
+        """
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
+            print(f"\n[EWC] Estimating Fisher for '{dataset_name}'...")
+
+        new_ewc = EWC.from_model(
+            accelerator=self.accelerator,
+            model=self.model,
+            dataloader=dataloader,
+            lambda_ewc=self.lambda_ewc,
+            num_batches=self.fisher_num_batches,
+            debug=self.debug,
+        )
+
+        if self.online_ewc and len(self.ewc_list) > 0:
+            # Online EWC (Schwarz et al. 2018): 누적 Fisher 1개 + 최신 θ*
+            old = self.ewc_list[-1]
+            merged_fisher = {}
+            for n, f_new in new_ewc.fisher.items():
+                f_old = old.fisher.get(n, torch.zeros_like(f_new))
+                merged_fisher[n] = self.ewc_gamma * f_old + f_new
+            self.ewc_list = [
+                EWC(
+                    fisher_cpu=merged_fisher,
+                    params_cpu=new_ewc.params,
+                    lambda_ewc=self.lambda_ewc,
+                )
+            ]
+        else:
+            self.ewc_list.append(new_ewc)
+
+        if self.accelerator.is_main_process:
+            print(f"[EWC] # of stored constraints: {len(self.ewc_list)}")
+
+        self.accelerator.wait_for_everyone()
+
+    # ─────────────────────────────────────────────────────────────────
+    def _init_wandb(self, dataset_name: str):
+        if self.wandb_initialized:
+            return
+        if not self.use_wandb:
+            wandb.init(mode="disabled")
+            self.wandb_initialized = True
+            return
+
+        if self.accelerator.is_main_process:
+            name_map = {
+                "new-medical-kor-dataset": "kor-medical",
+                "guidline_medical": "eng-medical",
+                "new-legal-kor-dataset": "kor-legal",
+                "eng-new-legal-dataset": "eng-legal",
+            }
+            wname = next(
+                (v for k, v in name_map.items() if k in dataset_name),
+                dataset_name,
+            )
+            wandb.init(
+                project="ewc-continual-pretraining",
+                config={
+                    "optimizer": "AdamW",
+                    "method": "EWC",
+                    "learning_rate": self.learning_rate,
+                    "model": self.model_name,
+                    "lambda_ewc": self.lambda_ewc,
+                    "fisher_num_batches": self.fisher_num_batches,
+                    "online_ewc": self.online_ewc,
+                    "ewc_gamma": self.ewc_gamma,
+                    "num_epochs": self.num_epochs,
+                    "batch_size": self.batch_size,
+                    "max_length": self.max_length,
+                    "chunk_size": self.chunk_size,
+                    "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                    "seed": self.seed,
+                    "num_stages": len(self.dataset_list),
+                    "padding_side": "left",
+                    "fsdp": True,
+                },
+                name=f"ewc_lam{self.lambda_ewc}_ep{self.num_epochs}_{wname}_{self.seed}",
+                group="ewc_cpt",
+            )
+        else:
+            wandb.init(mode="disabled")
+        self.wandb_initialized = True
+
+    # ─────────────────────────────────────────────────────────────────
+    def _save_model(self, dataset_name: str, epoch: int):
+        self.accelerator.wait_for_everyone()
+        save_path = os.path.join(self.output_dir, f"{dataset_name}_epoch_{epoch}")
+        if self.accelerator.is_main_process:
+            os.makedirs(save_path, exist_ok=True)
+
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        unwrapped.save_pretrained(
+            save_path,
+            is_main_process=self.accelerator.is_main_process,
+            save_function=self.accelerator.save,
+            state_dict=self.accelerator.get_state_dict(self.model),
+            safe_serialization=True,
+        )
+        if self.accelerator.is_main_process:
+            self.tokenizer.save_pretrained(save_path)
+            if (hasattr(unwrapped, "generation_config")
+                    and unwrapped.generation_config is not None):
+                unwrapped.generation_config.save_pretrained(save_path)
+            config_path = os.path.join(save_path, "config.json")
+            if not os.path.exists(config_path):
+                unwrapped.config.to_json_file(config_path)
+            print(f"✅ Model saved: {save_path}")
+        self.accelerator.wait_for_everyone()
+
+    # ─────────────────────────────────────────────────────────────────
+    def train_on_dataset(self, dataloader, dataset_name: str):
+        self._init_wandb(dataset_name)
+
+        if self.accelerator.is_main_process:
+            print(f"[INFO] [AdamW+EWC/CPT] Training on: {dataset_name} "
+                  f"(stage {self.current_stage_idx + 1}, "
+                  f"# prev EWC tasks={len(self.ewc_list)})")
+
+        # model/optimizer는 이미 prepare 완료. dataloader만 prepare.
+        dataloader = self.accelerator.prepare(dataloader)
+
+        for epoch in range(self.num_epochs):
+            set_seed(self.seed + epoch, deterministic=True)
+            self.model.train()
+            sum_total, sum_task, sum_ewc, n_step = 0.0, 0.0, 0.0, 0
+
+            progress_bar = tqdm(
+                dataloader,
+                desc=f"{dataset_name} | Epoch {epoch + 1}/{self.num_epochs}",
+                disable=not self.accelerator.is_main_process,
+                leave=False,
+            )
+
+            for step, batch in enumerate(progress_bar):
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+                labels = batch["labels"]
+
+                if self.debug and step == 0 and self.accelerator.is_main_process:
+                    valid_cnt = (labels != -100).sum().item()
+                    is_left = assert_left_padded(input_ids, attention_mask)
+                    print(
+                        f"[debug][train] {dataset_name} | "
+                        f"bsz={input_ids.size(0)}, seq_len={input_ids.size(1)}, "
+                        f"valid_labels={valid_cnt}, left_padded={is_left}, "
+                        f"prev_ewc_tasks={len(self.ewc_list)}"
+                    )
+
+                valid_cnt = (labels != -100).sum().item()
+                if valid_cnt == 0:
+                    if self.debug and self.accelerator.is_main_process:
+                        print(f"[warn] step {step}: no valid labels, skip")
+                    continue
+
+                with self.accelerator.accumulate(self.model):
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    task_loss = outputs.loss
+                    ewc_loss = self._compute_ewc_penalty()
+                    total_loss = task_loss + ewc_loss
+
+                    self.accelerator.backward(total_loss)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                # ── logging values ──────────────────────────────
+                task_val = float(task_loss.detach().item())
+                ewc_val = float(ewc_loss.detach().item()) if isinstance(ewc_loss, torch.Tensor) else float(ewc_loss)
+                total_val = float(total_loss.detach().item())
+
+                self.global_update_step += 1
+                sum_total += total_val
+                sum_task += task_val
+                sum_ewc += ewc_val
+                n_step += 1
+
+                if self.accelerator.is_main_process:
+                    wandb.log({
+                        "train/step": self.global_update_step,
+                        "train/task_loss": task_val,
+                        "train/ewc_loss": ewc_val,
+                        "train/total_loss": total_val,
+                        "train/valid_labels": valid_cnt,
+                        "train/prev_ewc_tasks": len(self.ewc_list),
+                        "train/dataset": dataset_name,
+                        "epoch": epoch + 1,
+                    })
+
+                progress_bar.set_postfix({
+                    "Task": f"{task_val:.4f}",
+                    "EWC": f"{ewc_val:.4f}",
+                    "Total": f"{total_val:.4f}",
+                    "Step": f"{step + 1}/{len(dataloader)}",
+                })
+
+            avg_total = sum_total / max(n_step, 1)
+            avg_task = sum_task / max(n_step, 1)
+            avg_ewc = sum_ewc / max(n_step, 1)
+
+            if self.accelerator.is_main_process:
+                print(f"\n[{dataset_name}] Epoch {epoch + 1} | "
+                      f"AvgTotal={avg_total:.4f}, AvgTask={avg_task:.4f}, AvgEWC={avg_ewc:.4f}")
+                wandb.log({
+                    "epoch/avg_total_loss": avg_total,
+                    "epoch/avg_task_loss": avg_task,
+                    "epoch/avg_ewc_loss": avg_ewc,
+                    "epoch": epoch + 1,
+                })
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            self._save_model(dataset_name, epoch + 1)
+
+        # ── stage 종료 후 Fisher 추정 → ewc_list 업데이트 ──
+        self._update_ewc_after_stage(dataloader, dataset_name)
+
+    # ─────────────────────────────────────────────────────────────────
+    def train_across_datasets(self):
+        """
+        CPT stream:
+          for each stage:
+            - 학습
+            - Fisher 추정 → ewc_list append (또는 online merge)
+          → 다음 stage에서는 누적된 EWC penalty가 task loss와 함께 적용됨.
+        Optimizer state는 stage 간 유지.
+        """
+        for stage_idx, dataset_file in enumerate(self.dataset_list):
+            self.current_stage_idx = stage_idx
+            dataset_name = os.path.basename(dataset_file).split(".")[0]
+
+            if self.accelerator.is_main_process:
+                print(f"\n{'=' * 60}")
+                print(f"[Stage {stage_idx + 1}/{len(self.dataset_list)}] {dataset_name}")
+                print(f"  global_update_step before stage : {self.global_update_step}")
+                print(f"  # EWC constraints before stage  : {len(self.ewc_list)}")
+                print(f"{'=' * 60}")
+
+            _, dataloader = self.prepare_data(dataset_file)
+            self.train_on_dataset(dataloader, dataset_name)
+
+            del dataloader
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if self.wandb_initialized:
+            wandb.finish()
+
+
+if __name__ == "__main__":
+    trainer = EWCTrainer(
+        model_name="meta-llama/Llama-3.2-1B",
+        dataset_list=[
+            "/home/jovyan/sumin_data/cp4llm/utils/data_storage/new-medical-kor-dataset.txt",
+            "/home/jovyan/sumin_data/cp4llm/utils/data_storage/guidline_medical.txt",
+            "/home/jovyan/sumin_data/cp4llm/utils/data_storage/new-legal-kor-dataset.txt",
+            "/home/jovyan/sumin_data/cp4llm/utils/data_storage/eng-new-legal-dataset.txt",
+        ],
+        output_dir="/home/jovyan/sumin_data/saved_model/ewc_cpt/",
+        batch_size=2,
+        num_epochs=1,
+        learning_rate=2e-5,
+        max_length=256,
+        chunk_size=64,
+        gradient_accumulation_steps=8,
+        num_workers=4,
+        # EWC hyperparameters (LLM 스케일)
+        lambda_ewc=10.0,
+        fisher_num_batches=200,
+        online_ewc=False,          # True → 메모리 일정, 누적 1개로 압축
+        ewc_gamma=0.95,
+        seed=777,
+        debug=True,
+        use_wandb=True,
+    )
+    trainer.load_model_and_tokenizer()
+    trainer.train_across_datasets()
