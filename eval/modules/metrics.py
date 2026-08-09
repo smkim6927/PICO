@@ -1,33 +1,53 @@
+# eval/modules/metrics.py
+
 import math
 import torch
 import numpy as np
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, r2_score
 from rouge_score import rouge_scorer
 import evaluate
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+# 1. Metrics Related to Continual Learning
+def compute_fwt(R_matrix, current_task):
+    """
+    Forward Transfer (FWT)
 
-# 1) Metrics related to Continual Learning
+    R_matrix: 2D list or np.array; R_matrix[t][j] = performance at stage j after stage t
+    current_task: Number of tasks for which training is complete (1-based)
 
+    FWT = (1/(T-1)) * sum_{t=2}^{T} (R[t,t] - R[t-1,t])
+    """
+    if current_task <= 1:
+        return 0.0
+
+    fwt_sum = 0.0
+    count = 0
+    for t in range(1, current_task):
+        v_after = R_matrix[t][t]
+        v_before = R_matrix[t - 1][t]
+        if np.isfinite(v_after) and np.isfinite(v_before):
+            fwt_sum += (v_after - v_before)
+            count += 1
+
+    return fwt_sum / count if count > 0 else 0.0
+    
 def compute_avgf(accuracies_max, accuracies_final, current_task):
     """
     Average Forgetting (AvgF)
 
-    - accuracies_max[i]   
-      The maximum performance observed so far for Task i (max_t R_{t,i})
-    - accuracies_final[i]
-      Performance of task i at the current point in time (current_task) (R_{T,i})
-    - current_task
-      Number of tasks completed so far (1-based, T)
+    - accuracies_max[i]   : The maximum performance observed so far for task i (e.g., max_t R_{t,i})
+    - accuracies_final[i] : Performance of task i at the current time step (current_task) (e.g., R_{T,i})
+    - current_task        : Number of tasks completed so far (1-based, T)
 
-    F_T = (1/(T-1)) * sum_{i=1..T-1} ( max_{t<=T} R_{t,i} - R_{T,i} ) implemented as an accuracy version.
+        F_T = (1/(T-1)) * sum_{i=1..T-1} ( max_{t<=T} R_{t,i} - R_{T,i} )
     """
     if current_task <= 1:
         return 0.0
     
     forgetting_sum = 0.0
-    # Consider the task index to be 0-based: 0 .. current_task-2
+    # Treat the task index as 0-based: 0 .. current_task-2
     for i in range(current_task - 1):
         forgetting_sum += (accuracies_max[i] - accuracies_final[i])
     return forgetting_sum / (current_task - 1)
@@ -37,14 +57,11 @@ def compute_bwt(accuracies_final, accuracies_init, current_task):
     """
     Backward Transfer (BWT)
 
-    - accuracies_init[i]
-      task i's performance 'immediately after initial training' (e.g., R_{i,i})
-    - accuracies_final[i]
-      Performance of task i at the current point in time (current_task) (e.g., R_{T,i})
-    - current_task
-      Number of tasks completed so far (1-based, T)
+    - accuracies_init[i]  : Performance of task i "immediately after the first training run" (e.g., R_{i,i})
+    - accuracies_final[i] : Performance of task i at the current time (current_task) (e.g., R_{T,i})
+    - current_task        : Number of tasks completed so far (1-based, T)
 
-    Lopez-Paz & Ranzato (2017):
+    Lopez-Paz & Ranzato (2017)의 정의와 같은 형태:
         BWT_T = (1/(T-1)) * sum_{i=1..T-1} ( R_{T,i} - R_{i,i} )
     """
     if current_task <= 1:
@@ -58,14 +75,17 @@ def compute_bwt(accuracies_final, accuracies_init, current_task):
 
 def compute_fisher_information(model, dataloader, criterion):
     """
-    Function for estimating Fisher information.
+    A function that estimates the Fisher Information.
 
-    - Empirical Fisher: E[ (∂ log p(y|x) / ∂θ)^2 ]. Approximated by averaging the squares of the gradients at each batch unit.
-    - in each batch loss = CrossEntropyLoss(ignore_index=-100, reduction='mean')
-    - When the gradient with respect to it is denoted as g_batch,
+    - Empirical Fisher: Approximate E[ (∂ log p(y|x) / ∂θ)^2 ] by averaging the squares of the gradients at the batch level.
+
+    Implementation Choices:
+    - For each batch, loss = CrossEntropyLoss(ignore_index=-100, reduction='mean')
+    - Let g_batch be the gradient for this;
       Fisher ≈ (1 / #batches) * sum_batch g_batch^2
+    - Does not depend on the length of `dataloader.dataset` to support `IterableDataset`.
     """
-    # Fisher tensor init
+    # Initializing the Fisher Tensor
     fisher_information = {
         name: torch.zeros_like(param)
         for name, param in model.named_parameters()
@@ -78,6 +98,7 @@ def compute_fisher_information(model, dataloader, criterion):
     num_batches = 0
 
     for batch in dataloader:
+        # Move the layout to the device
         batch = {k: v.to(device) for k, v in batch.items()}
 
         model.zero_grad(set_to_none=True)
@@ -89,6 +110,7 @@ def compute_fisher_information(model, dataloader, criterion):
         logits = outputs.logits
         labels = batch["labels"]
 
+        # Assuming CrossEntropyLoss(ignore_index=-100, reduction='mean' or 'sum') as the criterion
         loss = criterion(
             logits.view(-1, logits.size(-1)),
             labels.view(-1),
@@ -112,7 +134,7 @@ def compute_fisher_information(model, dataloader, criterion):
 def compute_delta_fisher(fisher_t, fisher_t_minus_1):
     """
     Calculate the Fisher Information change (L1 norm).
-    Sum of the L1 norm of the Fisher tensor difference at two time points t and t-1.
+    The sum of the L1 norms of the differences between the Fisher tensors at two time points, t and t-1.
     """
     delta = 0.0
     for name in fisher_t:
@@ -125,12 +147,12 @@ def compute_delta_fisher(fisher_t, fisher_t_minus_1):
 
 def update_ema_parameters(ema_params, current_params, alpha=0.999):
     """
-    Exponential Moving Average(EMA) Parameter Update.
+    Exponential Moving Average (EMA) Parameter Update.
 
     ema_new = alpha * ema_old + (1 - alpha) * current
     """
     if ema_params is None:
-        # If it is the first step, use the current parameter as the EMA.
+        # If this is the first step, use the current parameters as-is for the EMA
         return {name: param.clone().detach() for name, param in current_params.items()}
     
     updated_ema = {}
@@ -149,7 +171,7 @@ def compute_ema_drift(ema_params, current_params):
 
     drift = ||θ_t - θ_ema||_2 / ||θ_ema||_2
 
-    - The denominator is normalized by the L2 norm of the EMA parameters.
+    - The denominator is normalized by the L2 norm of the EMA parameter.
     """
     if ema_params is None:
         return 0.0
@@ -175,10 +197,12 @@ def compute_ema_drift(ema_params, current_params):
 
 def calculate_plasticity(loss_before, loss_after, eps=1e-8):
     """
-    Calculate "plasticity" based on the reduction in pre- and post-learning loss for new tasks.
+    "Plasticity" is calculated based on the reduction in loss before and after learning a new task.
 
     plasticity = clip( (loss_before - loss_after) / (loss_before + eps), 0, 1 )
 
+    - If it is less than or equal to 0, it is 0
+    - If it is greater than or equal to 1, it is 1
     """
     delta_loss = loss_before - loss_after
     relative_improvement = delta_loss / (loss_before + eps)
@@ -187,21 +211,21 @@ def calculate_plasticity(loss_before, loss_after, eps=1e-8):
 
 
 class ContinualLearningMetrics:
-    """A class for managing and calculating metrics related to continuous learning."""
+    """A class that manages and calculates metrics related to continuous learning."""
     def __init__(self, num_tasks):
         self.num_tasks = num_tasks
-        self.accuracies_max = [0.0] * num_tasks      # Peak performance for each task
-        self.accuracies_init = [0.0] * num_tasks     # Performance immediately after task learning R_{i,i}
-        self.accuracies_current = [0.0] * num_tasks  # Current performance R_{T,i}
+        self.accuracies_max = [0.0] * num_tasks      # Best Performance for Each Task
+        self.accuracies_init = [0.0] * num_tasks     # Performance Immediately After Task Training
+        self.accuracies_current = [0.0] * num_tasks  # Current Performance
         self.fisher_history = []
         self.ema_params = None
         
     def update_accuracy(self, task_id, accuracy, is_init=False):
         """
-        Task-specific accuracy update.
+        Accuracy updates by task.
 
         - task_id: 0-based index
-        - is_init=True: When the task's performance is immediately after initial training (R_{i,i})
+        - is_init=True: When performance is at the level immediately after the initial training on that task
         """
         self.accuracies_current[task_id] = accuracy
         if is_init:
@@ -214,7 +238,6 @@ class ContinualLearningMetrics:
         Calculate all continuous learning metrics.
 
         - current_task: Number of tasks completed so far (1-based)
-        - When dataloader and criterion are provided, also update Fisher-based metrics.
         """
         metrics = {}
         metrics['AvgF'] = compute_avgf(
@@ -224,7 +247,7 @@ class ContinualLearningMetrics:
             self.accuracies_current, self.accuracies_init, current_task
         )
         
-        # Fisher based metric
+        # Fisher-based indicators (optional)
         if dataloader is not None and criterion is not None:
             current_fisher = compute_fisher_information(model, dataloader, criterion)
             self.fisher_history.append(current_fisher)
@@ -240,14 +263,13 @@ class ContinualLearningMetrics:
         
         return metrics
 
-# 2) Text Generation Quality Metrics
-
+# 2. Metrics Related to Text Generation Quality
 def calculate_groundedness(prediction, context):
     """
-    Calculate how grounded the generated response (prediction) is in the given context.
+    Calculate the extent to which the generated response (prediction) is based on the given context.
 
-    Simply:
-        groundedness = (# of tokens in the prediction that also appear in the context) / (# of tokens in the prediction)
+    shortly:
+        groundedness = (number of tokens in the prediction that also appear in the context) / (number of tokens in the prediction)
     """
     pred_tokens = set(prediction.lower().split())
     context_tokens = set(context.lower().split())
@@ -263,9 +285,9 @@ def calculate_metrics(predictions, labels, losses, inputs):
 
     Args:
         predictions: List[str] - Generated text
-        labels:      List[str] - Ground truth text
-        losses:      List[float] - (Optional) Per-example loss (Only the average is used)
-        inputs:      List[str] - Prompt/context text (For groundedness)
+        labels:      List[str] - Correct answer text
+        losses:      List[float] - (optional) per-example loss (only the average is used)
+        inputs:      List[str] - Prompt/context text (for groundedness)
     """
     rouge_scorer_obj = rouge_scorer.RougeScorer(
         ['rouge1', 'rouge2', 'rougeL'], use_stemmer=True
@@ -276,7 +298,7 @@ def calculate_metrics(predictions, labels, losses, inputs):
     cosine_similarities = []
     jaccard_similarities = []
 
-    # Using BLEU and METEOR in HuggingFace evaluate Library
+    # Using BLEU and METEOR with HuggingFace evaluate
     bleu_metric = evaluate.load('bleu')
     meteor_metric = evaluate.load('meteor')
 
@@ -313,10 +335,10 @@ def calculate_metrics(predictions, labels, losses, inputs):
                 vectors = vectorizer.transform([pred_str.strip(), label_str.strip()])
                 cosine_similarities.append(cosine_similarity(vectors)[0, 1])
             except ValueError:
-                # When a CountVectorizer error occurs due to empty vocabulary, etc.
+                # Cases where a CountVectorizer error occurs due to an empty vocabulary, etc.
                 cosine_similarities.append(0.0)
 
-    # BLEU / METEOR is computed only once for the entire sample.
+    # BLEU / METEOR is computed only once for the entire sample
     references_for_eval = [[lbl] for lbl in labels]
     bleu_results = bleu_metric.compute(
         predictions=predictions, references=references_for_eval
@@ -325,7 +347,7 @@ def calculate_metrics(predictions, labels, losses, inputs):
         predictions=predictions, references=references_for_eval
     )
     
-    # If the loss list is empty, treat it as 0.0.
+    # If the `loss` list is empty, treat it as 0.0
     avg_loss = float(np.mean(losses)) if len(losses) > 0 else 0.0
     
     results = {
