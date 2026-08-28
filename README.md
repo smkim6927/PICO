@@ -248,33 +248,6 @@ entry will be replaced with the official venue BibTeX upon publication.
 
 ---
 
-## Data sources
-
-The Korean Medical stage combines material derived from two AI Hub datasets,
-per the paper's data appendix. Work using this stage must acknowledge both.
-
-```bibtex
-@misc{aihub_med_legal_books,
-  title        = {Medical and Legal Professional Book Corpus},
-  author       = {{National Information Society Agency}},
-  year         = {2022},
-  howpublished = {AI Hub, dataset 71487, version 1.2},
-  note         = {Constructed under the Ministry of Science and ICT
-                  intelligent information industry infrastructure program.
-                  Accessed via \url{https://aihub.or.kr}}
-}
-
-@misc{aihub_professional_domain_corpus,
-  title        = {Professional Domain Corpus},
-  author       = {{National Information Society Agency}},
-  year         = {2021},
-  howpublished = {AI Hub, dataset 110, version 1.1},
-  note         = {Constructed under the Ministry of Science and ICT
-                  intelligent information industry infrastructure program.
-                  Accessed via \url{https://aihub.or.kr}}
-}
-```
-
 ## License
 
 Code is released under the MIT License (see `LICENSE`). Corpus text is not
