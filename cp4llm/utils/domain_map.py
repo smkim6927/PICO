@@ -141,7 +141,7 @@ domain_info = {
         "parser_fn": None,
     },
     "eng_medical": {
-        "pretrain_data_path": "utils/data_storage/guidline_medical.txt",
+        "pretrain_data_path": "aigogongburani/PICO_Cross-Lingual_CPT_Corpora + data/guidline_medical.txt",
         "dataset_name": "Shekswess/medical_gemma_instruct_dataset",
         "encoding": "utf-8",
         # 이 데이터셋은 features: ['output', 'input', 'instruction']
@@ -151,7 +151,7 @@ domain_info = {
         "parser_fn": None,
     },
     "kor_legal": {
-        "pretrain_data_path": "utils/data_storage/new-legal-kor-dataset.txt",
+        "pretrain_data_path": "aigogongburani/PICO_Cross-Lingual_CPT_Corpora + data/new-legal-kor-dataset.txt",
         "dataset_name": "jihye-moon/LawQA-Ko",
         "encoding": "utf-8",
         "columns": {"text": "question", "target": "answer"},
@@ -160,7 +160,7 @@ domain_info = {
     },
 
     "eng_legal": {
-        "pretrain_data_path": "utils/data_storage/eng-new-legal-dataset.txt",
+        "pretrain_data_path": "aigogongburani/PICO_Cross-Lingual_CPT_Corpora + data/eng-new-legal-dataset.txt",
         "dataset_name": "joelniklaus/legal_case_document_summarization",
         "encoding": "utf-8",
         "columns": {"text": "judgement", "target": "summary"},
@@ -195,12 +195,12 @@ domain_info = {
     "es_legal": {
         "pretrain_data_path": "utils/data_storage/es-legal-dataset.txt",
         "dataset_name": "SINAI/ALIA-es-legal-administrative-cqa",
-        "hf_split": "parlamint_es_an",  # EvalRunner 의 split="train" 을 오버라이드
+        "hf_split": "parlamint_es_an",
         "encoding": "utf-8",
         "columns": {"text": "question", "target": "answer"},
         "task_type": "qa",
         "parser_fn": _parse_alia_legal_cqa,
-        "truncate_source": True,        # ParlaMint 발화 context 가 길 수 있음
+        "truncate_source": True,
     },
 }
 
