@@ -180,7 +180,7 @@ optimizer = PICO(
     weight_decay=0.01,
     beta_utility=0.999,
     sigma=0.001,                # sigma_0, camera-ready audited value
-    spectral_update_freq=1,     # f = 1 main; f = 10 for the scaling study
+    spectral_update_freq=1,     # f = 1 main, f = 10 for the scaling study
     power_iterations=1,         # K
 )
 
@@ -198,7 +198,7 @@ for batch in dataloader:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt      # frozen experiment environment + repo extras
-accelerate config                    # choose MULTI_GPU (DDP); FSDP is rejected
+accelerate config                    # choose MULTI_GPU (DDP)
 export HF_TOKEN=hf_xxx               # corpus repo access
 
 # Korean Medical combines material from AI Hub datasets 71487 (v1.2)
