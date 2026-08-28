@@ -11,27 +11,23 @@ Method summary
 --------------
   pico     PICO optimizer. GateU + SpecFlag + group pause + gated noise.
   adam     Adam, constant LR. The plain sequential baseline.
-  adamw    AdamW with decoupled weight decay.
   sgd      plain SGD. Momentum is fixed at 0 and cannot be overridden.
-  ewc      AdamW plus Elastic Weight Consolidation penalty.
+  ewc      Adam plus Elastic Weight Consolidation penalty.
   replay   Adam plus a FIFO token replay buffer, mixed batches.
   rewarm   Adam plus a per-stage warmup and cosine schedule.
   mer      Adam plus replay plus MER-style Reptile interpolation.
-  lora     LoRA adapters trained with AdamW.
+  lora     LoRA adapters trained with Adam.
 
 Deliberate changes from the original per-method scripts
 -------------------------------------------------------
-  1. FSDP removed everywhere. Several scripts imported
-     FullyShardedDataParallelPlugin or referenced an undefined
-     transformer_auto_wrap_policy, which raised NameError at import.
-  2. Global TF32 enabling in the replay script removed. It changed matmul
+
+  1. Global TF32 enabling in the replay script removed. It changed matmul
      precision for that arm only.
-  3. Gradient clipping removed from LoRA and MER. PICO uses none.
-  4. Batch size, accumulation, epochs, LR, seed, and workers unified.
-  5. Checkpoint directories keyed by stage id, not by source filename.
-  6. LoRA no longer imports the stale optimizer.IVE module. It uses AdamW,
-     which is what its own logging already claimed.
-  7. MER now uses the shared TextDatasetwchunk pipeline instead of its own
+  2. Gradient clipping removed from LoRA and MER. PICO uses none.
+  3. Batch size, accumulation, epochs, LR, seed, and workers unified.
+  4. Checkpoint directories keyed by stage id, not by source filename.
+  5. LoRA uses Adam.
+  6. MER now uses the shared TextDatasetwchunk pipeline instead of its own
      packing loop. The two produced different token streams.
 """
 
@@ -43,7 +39,7 @@ from collections import deque
 from typing import Dict, List, Optional
 
 import torch
-from torch.optim import SGD, Adam, AdamW
+from torch.optim import SGD, Adam
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
@@ -71,9 +67,7 @@ class PICOTrainer(BaseCPTTrainer):
         )
 
 
-# =============================================================================
 # Plain optimizer baselines
-# =============================================================================
 
 class AdamTrainer(BaseCPTTrainer):
     method_name = "adam"
@@ -81,16 +75,6 @@ class AdamTrainer(BaseCPTTrainer):
     def build_optimizer(self, model):
         return Adam(model.parameters(), lr=self.learning_rate,
                     betas=(0.9, 0.999), eps=1e-8)
-
-
-class AdamWTrainer(BaseCPTTrainer):
-    method_name = "adamw"
-
-    def build_optimizer(self, model):
-        return AdamW(model.parameters(), lr=self.learning_rate,
-                     betas=(0.9, 0.999), eps=1e-8,
-                     weight_decay=self.args.weight_decay)
-
 
 class SGDTrainer(BaseCPTTrainer):
     """Paper H.2.1: plain SGD, no momentum, no weight decay, no Nesterov.
@@ -105,9 +89,7 @@ class SGDTrainer(BaseCPTTrainer):
                    nesterov=False)
 
 
-# =============================================================================
-# EWC (Kirkpatrick et al., PNAS 2017; online variant Schwarz et al., 2018)
-# =============================================================================
+# EWC 
 
 class _EWCConstraint:
     def __init__(self, fisher_cpu: dict, params_cpu: dict, lambda_ewc: float):
@@ -135,9 +117,8 @@ class EWCTrainer(BaseCPTTrainer):
         self.constraints: List[_EWCConstraint] = []
 
     def build_optimizer(self, model):
-        return AdamW(model.parameters(), lr=self.learning_rate,
-                     betas=(0.9, 0.999), eps=1e-8,
-                     weight_decay=self.args.weight_decay)
+        return Adam(model.parameters(), lr=self.learning_rate,
+                     betas=(0.9, 0.999), eps=1e-8)
 
     def extra_loss(self):
         if not self.constraints:
@@ -218,10 +199,7 @@ class EWCTrainer(BaseCPTTrainer):
         self.accelerator.wait_for_everyone()
 
 
-# =============================================================================
 # Replay
-# =============================================================================
-
 class _TokenReplayBuffer:
     """FIFO buffer. Sampling uses a dedicated generator seeded identically on
     every rank, so all ranks draw the same replay rows."""
@@ -322,10 +300,7 @@ class ReplayTrainer(BaseCPTTrainer):
         self.accelerator.wait_for_everyone()
 
 
-# =============================================================================
-# Re-warm (Gupta et al., 2023)
-# =============================================================================
-
+# Re-warm
 class RewarmTrainer(BaseCPTTrainer):
     method_name = "rewarm"
 
@@ -361,10 +336,7 @@ class RewarmTrainer(BaseCPTTrainer):
             self.scheduler.step()
 
 
-# =============================================================================
-# MER-style Reptile with replay (Abbes et al., CoLLAs 2025)
-# =============================================================================
-
+# MER-style Reptile with replay
 class MERTrainer(ReplayTrainer):
     method_name = "mer"
 
@@ -408,10 +380,7 @@ class MERTrainer(ReplayTrainer):
                   f"window drift L2 = {math.sqrt(drift_sq):.4e}")
 
 
-# =============================================================================
 # LoRA
-# =============================================================================
-
 class LoRATrainer(BaseCPTTrainer):
     method_name = "lora"
 
@@ -520,7 +489,6 @@ class SophiaTrainer(BaseCPTTrainer):
 METHODS: Dict[str, type] = {
     "pico": PICOTrainer,
     "adam": AdamTrainer,
-    "adamw": AdamWTrainer,
     "sgd": SGDTrainer,
     "ewc": EWCTrainer,
     "replay": ReplayTrainer,
