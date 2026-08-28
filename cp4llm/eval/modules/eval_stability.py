@@ -35,7 +35,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.append(str(_PROJECT_ROOT))
 
-from utils.domain_map import (  # noqa: E402
+from utils.domain_map import (
     EVAL_DUPLICATE_POLICY,
     EVAL_MANIFEST_TYPE,
     EVAL_SCHEMA_VERSION,
