@@ -131,17 +131,9 @@ WCR is intended for non-negative, higher-is-better metrics such as BLEU and ROUG
 
 ## Evaluation Metrics
 
-The evaluation pipeline reports the following text-generation metrics:
+The paper reports five text-generation metrics: ROUGE-L, BLEU, METEOR, cosine similarity, and Token F1.
 
-* BLEU
-* ROUGE-1
-* ROUGE-2
-* ROUGE-L
-* METEOR
-* Cosine Similarity
-* Token Precision
-* Token Recall
-* Token F1
+The evaluation pipeline additionally computes chrF, ROUGE-1, ROUGE-2, token precision, and token recall as diagnostics.
 
 For each supported higher-is-better metric, continual-learning behavior is summarized using:
 
@@ -155,15 +147,23 @@ For each supported higher-is-better metric, continual-learning behavior is summa
 ## Repository Structure
 
 ```text
-eval/
-├── run_cl_eval.py
-└── modules/
-    ├── cl_evaluator.py
-    ├── eval_stability.py
-    └── metrics.py
+cp4llm/
+├── train_cpt.py            one training entry point for PICO and all baselines
+├── train/
+│   ├── common.py           shared loop, data pipeline, seeding, checkpointing
+│   └── methods.py          PICO + 9 baselines as hook subclasses
+├── optimizer/PICO.py       the optimizer
+├── eval/
+│   ├── run_cl_eval.py      continual-learning evaluation entry point
+│   ├── cl_metrics.py       FWT / BWT / AvgF / CR / WCR from cl_summary.json
+│   └── modules/            evaluator, generation runner, text metrics
+└── utils/                  dataset loader, frozen evaluation manifests
+scripts/
+├── env.sh                  shared conditions, one place for every method
+├── train.sh                method x {777, 911, 4041} training
+├── eval.sh                 evaluation with auto-built curriculum
+└── run_all.sh              train then evaluate, one command
 ```
-
-`metrics.py` contains the text-quality metrics and the FWT, BWT, AvgF, and WCR calculations.
 
 ---
 
@@ -172,38 +172,53 @@ eval/
 PICO follows the standard optimizer interface and does not require changes to the model architecture.
 
 ```python
-from optim import PICO
+from optimizer.PICO import PICO
 
 optimizer = PICO(
     model.parameters(),
     lr=2e-5,
-    sigma0=0.01,
-    f=10,
+    weight_decay=0.01,
+    beta_utility=0.999,
+    sigma=0.001,                # sigma_0, camera-ready audited value
+    spectral_update_freq=1,     # f = 1 main; f = 10 for the scaling study
+    power_iterations=1,         # K
 )
 
 for batch in dataloader:
-    loss = model(batch).loss
+    loss = model(**batch).loss
     loss.backward()
-
     optimizer.step()
     optimizer.zero_grad()
 ```
 
-Adjust the import path and optimizer arguments to match the released repository configuration.
-
 ---
 
-## Evaluation
-
-Run continual-learning evaluation through the evaluation entry point:
+## Reproduction
 
 ```bash
-python eval/run_cl_eval.py [arguments]
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt      # frozen experiment environment + repo extras
+accelerate config                    # choose MULTI_GPU (DDP); FSDP is rejected
+export HF_TOKEN=hf_xxx               # corpus repo access
+
+# Korean Medical combines material from AI Hub datasets 71487 (v1.2)
+# and 110 (v1.1) and cannot be redistributed. Obtain them yourself, then:
+export KOR_MEDICAL_PATH=/data/aihub71487/new-medical-kor-dataset.txt
+
+bash scripts/run_all.sh pico         # PICO x seeds {777, 911, 4041}, train + eval
+bash scripts/run_all.sh all          # every method, method-outer seed-inner
+MODEL_SIZE=3b bash scripts/run_all.sh pico   # Llama-3.2-3B-Instruct
+MODEL_SIZE=8b bash scripts/run_all.sh pico   # Llama-3.1-8B-Instruct, balanced device map
 ```
 
-The evaluator constructs the stage-by-domain performance matrix and computes continual-learning metrics for the supported text-generation measures.
+PICO runs with `f = 1` at every scale, matching the primary configuration
+reported in the paper.
 
-Exact experiment commands and configurations should follow the released configuration files.
+Evaluation builds the four-stage curriculum from the checkpoints that training
+actually wrote and additionally probes `math` (GSM8K) as the evaluation-only
+out-of-domain benchmark. See `TRAINING.md` for the full unified-condition
+table, per-method hyperparameters, and everything that was changed relative to
+the original per-method scripts.
 
 ---
 
@@ -217,22 +232,55 @@ Results should not be interpreted as evidence that the same behavior necessarily
 
 ## Citation
 
-Citation information will be updated upon publication.
+The paper is not yet published. Please cite the preprint form below. This
+entry will be replaced with the official venue BibTeX upon publication.
 
 ```bibtex
-@misc{pico2026,
-  title  = {Plasticity without Collapse: Plasticity-Inducing Control Optimizer for Cross-Lingual Continual Pre-Training},
-  author = {TBD},
+@misc{kim2026pico,
+  title  = {Plasticity without Collapse: Plasticity-Inducing Control
+            Optimizer for Cross-Lingual Continual Pre-Training},
+  author = {Kim, Sumin and Song, Minjun and Lee, Surin and
+            Wahidur, Rahman S M and Lee, Yongtae and Choi, Haeung and
+            Lee, Heung-No},
   year   = {2026}
 }
 ```
 
 ---
 
+## Data sources
+
+The Korean Medical stage combines material derived from two AI Hub datasets,
+per the paper's data appendix. Work using this stage must acknowledge both.
+
+```bibtex
+@misc{aihub_med_legal_books,
+  title        = {Medical and Legal Professional Book Corpus},
+  author       = {{National Information Society Agency}},
+  year         = {2022},
+  howpublished = {AI Hub, dataset 71487, version 1.2},
+  note         = {Constructed under the Ministry of Science and ICT
+                  intelligent information industry infrastructure program.
+                  Accessed via \url{https://aihub.or.kr}}
+}
+
+@misc{aihub_professional_domain_corpus,
+  title        = {Professional Domain Corpus},
+  author       = {{National Information Society Agency}},
+  year         = {2021},
+  howpublished = {AI Hub, dataset 110, version 1.1},
+  note         = {Constructed under the Ministry of Science and ICT
+                  intelligent information industry infrastructure program.
+                  Accessed via \url{https://aihub.or.kr}}
+}
+```
+
 ## License
 
-TBD
-
-## Acknowledgements
-
-TBD
+Code is released under the MIT License (see `LICENSE`). Corpus text is not
+part of this repository. Each corpus follows its upstream terms as documented
+in `TRAINING.md` and the paper's data appendix. The Korean Medical sources
+are products of the Korean Ministry of Science and ICT intelligent
+information industry infrastructure program administered by the National
+Information Society Agency, and are obtained directly from AI Hub under its
+terms.
