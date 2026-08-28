@@ -109,12 +109,11 @@ runs use the same value.
 | `adam` | Adam | plain sequential baseline (H.2.1) |
 | `sophia` | SophiaG | GNB diagonal-Hessian preconditioning, k=10 (H.2.2) |
 | `sgd` | SGD | momentum fixed at 0 in code, no flag (H.2.1) |
-| `ewc` | AdamW | Fisher penalty, lambda=10, 200 Fisher batches (H.2.3) |
+| `ewc` | Adam | Fisher penalty, lambda=10, 200 Fisher batches (H.2.3) |
 | `replay` | Adam | FIFO buffer C=5000, N=2000, r=0.5 (H.2.4) |
 | `rewarm` | Adam | per-stage warmup and cosine schedule (H.2.6) |
 | `mer` | Adam | replay plus Reptile interpolation every k updates (H.2.5) |
 | `lora` | Adam | rank 16, alpha fixed at 16 in code, frozen base (H.2.7) |
-| `adamw` | AdamW | extra reference, not in the paper's baseline table |
 
 Each method is a subclass in `cp4llm/train/methods.py` that overrides only its
 hooks. The training loop, data pipeline, seeding, padding, and checkpointing all
@@ -162,7 +161,7 @@ These were real divergences between arms, not stylistic differences.
    36 and accumulation 8 to 16 and were superseded by the audited
    configuration.
 5. **LoRA no longer imports `optimizer.IVE`.** It used `HPO_v3_` while its own
-   logging recorded `"optimizer": "AdamW"`. It now uses AdamW.
+   logging recorded `"optimizer": "Adam"`. It now uses Adam.
 6. **MER uses the shared data pipeline.** Its own packing loop produced a
    different token stream from `TextDatasetwchunk`, so it was not comparable
    to the arm it was meant to be paired against.
